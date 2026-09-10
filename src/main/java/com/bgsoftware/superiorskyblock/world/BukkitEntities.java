@@ -169,12 +169,9 @@ public class BukkitEntities {
         if (!isTamed(entity))
             return categories;
 
-        EntityCategory tamedCategory = categorySettings.getCategoryByName(BuiltinEntityCategory.TAMED.name());
-        if (tamedCategory == null)
-            return categories;
-
         List<EntityCategory> applicableCategories = new LinkedList<>(categories);
-        applicableCategories.add(tamedCategory);
+        applicableCategories.remove(categorySettings.getCategoryByName(BuiltinEntityCategory.TAMEABLE.name()));
+        applicableCategories.add(categorySettings.getCategoryByName(BuiltinEntityCategory.TAMED.name()));
         return applicableCategories;
     }
 

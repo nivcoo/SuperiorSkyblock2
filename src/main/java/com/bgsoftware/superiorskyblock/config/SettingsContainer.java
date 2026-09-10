@@ -749,18 +749,17 @@ public class SettingsContainer {
 
         CommentedConfiguration cfg = CommentedConfiguration.loadConfiguration(file);
 
-        ConfigurationSection tameable = cfg.getConfigurationSection("TAMEABLE");
-        if (tameable != null) {
-            if (!cfg.contains("TAMED"))
-                cfg.createSection("TAMED");
-
-            for (Map.Entry<String, Object> entry : tameable.getValues(true).entrySet()) {
-                String path = "TAMED." + entry.getKey();
-                if (!(entry.getValue() instanceof ConfigurationSection) && !cfg.contains(path))
-                    cfg.set(path, entry.getValue());
-            }
-
-            cfg.set("TAMEABLE", null);
+        List<String> tameableNames = cfg.getKeys(false).stream()
+                .filter("TAMEABLE"::equalsIgnoreCase).collect(Collectors.toList());
+        ConfigurationSection tameable = tameableNames.size() != 1 ? null : cfg.getConfigurationSection(tameableNames.get(0));
+        if (tameable != null && "TAMED_ANIMAL_DAMAGE".equalsIgnoreCase(tameable.getString("actions.DAMAGE")) &&
+                cfg.getKeys(false).stream().noneMatch("TAMED"::equalsIgnoreCase)) {
+            cfg.set("TAMED.actions.DAMAGE", tameable.getString("actions.DAMAGE"));
+            tameable.set("actions.DAMAGE", null);
+            if (tameable.getConfigurationSection("actions").getKeys(false).isEmpty())
+                tameable.set("actions", null);
+            if (tameable.getKeys(false).isEmpty())
+                cfg.set(tameable.getName(), null);
             try {
                 cfg.save(file);
             } catch (IOException error) {

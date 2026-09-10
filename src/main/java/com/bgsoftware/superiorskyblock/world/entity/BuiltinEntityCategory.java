@@ -24,10 +24,16 @@ import java.util.Objects;
 
 public enum BuiltinEntityCategory {
 
-    TAMED(true) {
+    TAMEABLE {
         @Override
         protected boolean isEntityListedInternal(Class<? extends Entity> entityClass) {
             return Tameable.class.isAssignableFrom(entityClass);
+        }
+    },
+    TAMED(true) {
+        @Override
+        protected boolean isEntityListedInternal(Class<? extends Entity> entityClass) {
+            return TAMEABLE.isEntityListedInternal(entityClass);
         }
     },
     VEHICLE {
@@ -76,19 +82,19 @@ public enum BuiltinEntityCategory {
             return getEntitiesInternal();
         }
     };
-    private final boolean entityStateRequired;
+    private final boolean excludedFromTypeLookup;
     private WeakReference<EntityCategory> entityCategoryReference;
 
     BuiltinEntityCategory() {
         this(false);
     }
 
-    BuiltinEntityCategory(boolean entityStateRequired) {
-        this.entityStateRequired = entityStateRequired;
+    BuiltinEntityCategory(boolean excludedFromTypeLookup) {
+        this.excludedFromTypeLookup = excludedFromTypeLookup;
     }
 
-    public boolean requiresEntityState() {
-        return entityStateRequired;
+    public boolean isExcludedFromTypeLookup() {
+        return excludedFromTypeLookup;
     }
 
     public KeySet getEntities() {
