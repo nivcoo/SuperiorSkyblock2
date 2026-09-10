@@ -52,7 +52,7 @@ public class EntityTeleports {
             Message.TELEPORT_WARMUP.send(superiorPlayer, Formatters.TIME_FORMATTER.format(
                     Duration.ofMillis(warmupInMillis), superiorPlayer.getUserLocale()));
 
-            superiorPlayer.setTeleportTask(BukkitExecutor.sync(() -> teleportCallback.accept(true), warmupInMillis / 50));
+            superiorPlayer.setTeleportTask(BukkitExecutor.sync(superiorPlayer.asPlayer(), () -> teleportCallback.accept(true), warmupInMillis / 50));
         } else {
             teleportCallback.accept(false);
         }
@@ -76,8 +76,22 @@ public class EntityTeleports {
     public static void teleportUntilSuccess(Entity entity, Location location, long cooldown, @Nullable Runnable onFinish) {
         teleport(entity, location, result -> {
             if (result != PlayerTeleportAlgorithm.TeleportResult.SUCCESS) {
-                if (cooldown > 0) {
-                    BukkitExecutor.sync(() -> teleportUntilSuccess(entity, location, cooldown, onFinish), cooldown);
+                if (BukkitExecutor.isFolia()) {
+                    if (result == PlayerTeleportAlgorithm.TeleportResult.OFFLINE_PLAYER) {
+                        if (onFinish != null)
+                            onFinish.run();
+                        return;
+                    }
+                    try {
+                        plugin.getTaskScheduler().entity(entity,
+                                () -> teleportUntilSuccess(entity, location, cooldown, onFinish), onFinish, cooldown, 0L);
+                    } catch (Throwable error) {
+                        if (onFinish != null)
+                            onFinish.run();
+                        throw error;
+                    }
+                } else if (cooldown > 0) {
+                    BukkitExecutor.sync(entity, () -> teleportUntilSuccess(entity, location, cooldown, onFinish), cooldown);
                 } else {
                     teleportUntilSuccess(entity, location, cooldown, onFinish);
                 }
@@ -101,6 +115,17 @@ public class EntityTeleports {
 
         Preconditions.checkNotNull(homeLocation, "Cannot find a suitable home location for island " +
                 island.getUniqueId());
+
+        if (BukkitExecutor.isFolia() && !BukkitExecutor.isOwned(homeLocation)) {
+            BukkitExecutor.submit(homeLocation, () -> {
+                findIslandSafeLocation(island, dimension, result);
+                return null;
+            }).exceptionally(error -> {
+                result.completeExceptionally(error);
+                return null;
+            });
+            return;
+        }
 
         World islandsWorld = Objects.requireNonNull(plugin.getGrid().getIslandsWorld(island, dimension), "world is null");
         float rotationYaw = homeLocation.getYaw();
@@ -169,86 +194,127 @@ public class EntityTeleports {
 
         findSafeSpotInChunk(island, islandChunks, islandsWorld, homeLocation, safeSpot -> {
             if (safeSpot != null) {
-                result.complete(adjustLocationToHome(island, safeSpot.getBlock(), rotationYaw, rotationPitch));
+                BukkitExecutor.submit(safeSpot, () -> adjustLocationToHome(island, safeSpot.getBlock(),
+                        rotationYaw, rotationPitch)).whenComplete((location, error) -> {
+                    if (error == null)
+                        result.complete(location);
+                    else
+                        result.completeExceptionally(error);
+                });
             } else {
                 result.complete(null);
             }
-        });
+        }, result::completeExceptionally);
     }
 
     private static void findSafeSpotInChunk(Island island, Queue<ChunkPosition> islandChunks, World islandsWorld,
-                                            Location homeLocation, Consumer<Location> onResult) {
+                                            Location homeLocation, Consumer<Location> onResult, Consumer<Throwable> onError) {
         ChunkPosition chunkPosition = islandChunks.poll();
         if (chunkPosition == null) {
             onResult.accept(null);
             return;
         }
 
-        ChunksProvider.loadChunk(chunkPosition, ChunkLoadReason.FIND_SAFE_SPOT, null).whenComplete((chunk, err) -> {
-            ChunkSnapshot chunkSnapshot = chunk.getChunkSnapshot();
+        ChunksProvider.loadChunk(chunkPosition, ChunkLoadReason.FIND_SAFE_SPOT, null)
+                .thenCompose(chunk -> BukkitExecutor.submit(new Location(islandsWorld, chunk.getX() << 4,
+                        0, chunk.getZ() << 4), chunk::getChunkSnapshot)).whenComplete((chunkSnapshot, err) -> {
+            if (err != null) {
+                onError.accept(err);
+                return;
+            }
 
             if (WorldBlocks.isChunkEmpty(island, chunkSnapshot)) {
-                findSafeSpotInChunk(island, islandChunks, islandsWorld, homeLocation, onResult);
+                findSafeSpotInChunk(island, islandChunks, islandsWorld, homeLocation, onResult, onError);
+                return;
+            }
+
+            if (BukkitExecutor.isFolia()) {
+                Location chunkLocation = new Location(islandsWorld, chunkSnapshot.getX() << 4,
+                        0, chunkSnapshot.getZ() << 4);
+                BukkitExecutor.submit(chunkLocation, () -> findClosestSafeSpot(chunkSnapshot, islandsWorld, homeLocation))
+                        .whenComplete((location, error) -> {
+                            if (error != null)
+                                onError.accept(error);
+                            else if (location != null)
+                                onResult.accept(location);
+                            else
+                                findSafeSpotInChunk(island, islandChunks, islandsWorld, homeLocation, onResult, onError);
+                        });
                 return;
             }
 
             BukkitExecutor.createTask().runAsync(v -> {
-                Location closestSafeSpot = null;
-                double closestSafeSpotDistance = 0;
-
-                int worldBuildLimit = islandsWorld.getMaxHeight();
-                int worldMinLimit = plugin.getNMSWorld().getMinHeight(islandsWorld);
-
-                for (int x = 0; x < 16; x++) {
-                    for (int z = 0; z < 16; z++) {
-                        int y = chunkSnapshot.getHighestBlockYAt(x, z);
-
-                        if (y - 1 <= worldMinLimit || y + 1 >= worldBuildLimit)
-                            continue;
-
-                        int worldX = chunkSnapshot.getX() * 16 + x;
-                        int worldZ = chunkSnapshot.getZ() * 16 + z;
-
-                        // In some versions, the ChunkSnapshot#getHighestBlockYAt seems to return
-                        // one block above the actual highest block. Therefore, the check is on the
-                        // returned block and the block below it.
-                        Location safeSpot;
-                        if (WorldBlocks.isSafeBlock(chunkSnapshot, x, y, z)) {
-                            safeSpot = new Location(islandsWorld, worldX, y, worldZ);
-                        } else if (WorldBlocks.isSafeBlock(chunkSnapshot, x, y - 1, z)) {
-                            safeSpot = new Location(islandsWorld, worldX, y - 1, worldZ);
-                        } else {
-                            continue;
-                        }
-
-                        double distanceFromHome = safeSpot.distanceSquared(homeLocation);
-                        if (closestSafeSpot == null || distanceFromHome < closestSafeSpotDistance) {
-                            closestSafeSpotDistance = distanceFromHome;
-                            closestSafeSpot = safeSpot;
-                        }
-                    }
-                }
-
-                return closestSafeSpot;
-            }).runSync(location -> {
+                return findClosestSafeSpot(chunkSnapshot, islandsWorld, homeLocation);
+            })
+                    .runSync(location -> {
                 if (location != null) {
                     onResult.accept(location);
                 } else {
-                    findSafeSpotInChunk(island, islandChunks, islandsWorld, homeLocation, onResult);
+                    findSafeSpotInChunk(island, islandChunks, islandsWorld, homeLocation, onResult, onError);
                 }
             });
 
+        }).exceptionally(error -> {
+            onError.accept(error);
+            return null;
         });
     }
 
+    private static Location findClosestSafeSpot(ChunkSnapshot chunkSnapshot, World islandsWorld, Location homeLocation) {
+        Location closestSafeSpot = null;
+        double closestSafeSpotDistance = 0;
+
+        int worldBuildLimit = islandsWorld.getMaxHeight();
+        int worldMinLimit = plugin.getNMSWorld().getMinHeight(islandsWorld);
+
+        for (int x = 0; x < 16; x++) {
+            for (int z = 0; z < 16; z++) {
+                int y = chunkSnapshot.getHighestBlockYAt(x, z);
+
+                if (y - 1 <= worldMinLimit || y + 1 >= worldBuildLimit)
+                    continue;
+
+                int worldX = chunkSnapshot.getX() * 16 + x;
+                int worldZ = chunkSnapshot.getZ() * 16 + z;
+
+                // In some versions, the ChunkSnapshot#getHighestBlockYAt seems to return
+                // one block above the actual highest block. Therefore, the check is on the
+                // returned block and the block below it.
+                Location safeSpot;
+                if (WorldBlocks.isSafeBlock(chunkSnapshot, x, y, z)) {
+                    safeSpot = new Location(islandsWorld, worldX, y, worldZ);
+                } else if (WorldBlocks.isSafeBlock(chunkSnapshot, x, y - 1, z)) {
+                    safeSpot = new Location(islandsWorld, worldX, y - 1, worldZ);
+                } else {
+                    continue;
+                }
+
+                double distanceFromHome = safeSpot.distanceSquared(homeLocation);
+                if (closestSafeSpot == null || distanceFromHome < closestSafeSpotDistance) {
+                    closestSafeSpotDistance = distanceFromHome;
+                    closestSafeSpot = safeSpot;
+                }
+            }
+        }
+
+        return closestSafeSpot;
+    }
+
     private static void teleportEntity(Entity entity, Location location, @Nullable Consumer<PlayerTeleportAlgorithm.TeleportResult> teleportResult) {
-        entity.eject();
-        if(teleportResult == null) {
-            plugin.getProviders().getAsyncProvider().teleport(entity, location, null);
+        Location destination = BukkitExecutor.isFolia() ? location.clone() : location;
+        Runnable teleport = () -> {
+            entity.eject();
+            plugin.getProviders().getAsyncProvider().teleport(entity, destination, teleportResult == null ? null : res ->
+                    teleportResult.accept(res ? PlayerTeleportAlgorithm.TeleportResult.SUCCESS :
+                            PlayerTeleportAlgorithm.TeleportResult.GENERAL_FAILURE));
+        };
+        if (!BukkitExecutor.isFolia() || BukkitExecutor.isOwned(entity)) {
+            teleport.run();
         } else {
-            plugin.getProviders().getAsyncProvider().teleport(entity, location, res -> {
-                teleportResult.accept(res ? PlayerTeleportAlgorithm.TeleportResult.SUCCESS : PlayerTeleportAlgorithm.TeleportResult.GENERAL_FAILURE);
-            });
+            plugin.getTaskScheduler().entity(entity, teleport, () -> {
+                if (teleportResult != null)
+                    teleportResult.accept(PlayerTeleportAlgorithm.TeleportResult.OFFLINE_PLAYER);
+            }, 1L, 0L);
         }
     }
 

@@ -18,6 +18,7 @@ import com.bgsoftware.superiorskyblock.core.logging.Log;
 import com.bgsoftware.superiorskyblock.core.messages.Message;
 import com.bgsoftware.superiorskyblock.player.PlayerLocales;
 import com.google.common.base.Preconditions;
+import com.bgsoftware.superiorskyblock.core.threads.BukkitExecutor;
 import org.bukkit.Bukkit;
 import org.bukkit.command.CommandSender;
 import org.bukkit.command.defaults.BukkitCommand;
@@ -28,7 +29,8 @@ import java.lang.reflect.Constructor;
 import java.time.Duration;
 import java.util.Arrays;
 import java.util.Collections;
-import java.util.HashMap;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.HashSet;
 import java.util.LinkedList;
 import java.util.List;
@@ -39,7 +41,7 @@ import java.util.UUID;
 
 public class CommandsManagerImpl extends Manager implements CommandsManager {
 
-    private final Map<UUID, Map<String, Long>> commandsCooldown = new HashMap<>();
+    private final Map<UUID, Map<String, Long>> commandsCooldown = new ConcurrentHashMap<>();
 
     private final CommandsMap playerCommandsMap;
     private final CommandsMap adminCommandsMap;
@@ -143,6 +145,16 @@ public class CommandsManagerImpl extends Manager implements CommandsManager {
         return adminCommandsMap.getCommand(commandLabel);
     }
 
+    public static CompletableFuture<Boolean> dispatchCommand(CommandSender sender, String command) {
+        if (!BukkitExecutor.isFolia())
+            return CompletableFuture.completedFuture(Bukkit.dispatchCommand(sender, command));
+        if (sender instanceof Player) {
+            Player player = (Player) sender;
+            return BukkitExecutor.submit(player, () -> player.isOnline() && Bukkit.dispatchCommand(player, command));
+        }
+        return BukkitExecutor.submit(() -> Bukkit.dispatchCommand(sender, command));
+    }
+
     @Override
     public void dispatchSubCommand(CommandSender sender, String subCommand) {
         dispatchSubCommand(sender, subCommand, null);
@@ -152,7 +164,7 @@ public class CommandsManagerImpl extends Manager implements CommandsManager {
     public void dispatchSubCommand(CommandSender sender, String subCommand, @Nullable String args) {
         // We first check that the sub command is enabled.
         if (getCommand(subCommand) == null) {
-            Bukkit.dispatchCommand(sender, this.label + " " + subCommand + (args == null ? "" : " " + args));
+            dispatchCommand(sender, this.label + " " + subCommand + (args == null ? "" : " " + args));
             return;
         }
 
@@ -244,6 +256,17 @@ public class CommandsManagerImpl extends Manager implements CommandsManager {
 
         @Override
         public boolean execute(CommandSender sender, String label, String[] args) {
+            if (plugin.getTaskScheduler().isFolia()) {
+                if (!plugin.isReady()) {
+                    sender.sendMessage("SuperiorSkyblock is still starting. Please try again in a moment.");
+                    return false;
+                }
+                if (sender instanceof Player && !plugin.getTaskScheduler().isOwned((Player) sender)) {
+                    String[] arguments = args.clone();
+                    plugin.getTaskScheduler().entity((Player) sender, () -> execute(sender, label, arguments), null, 0L, 0L);
+                    return false;
+                }
+            }
             java.util.Locale locale = PlayerLocales.getLocale(sender);
 
             String executedSubCommand;
@@ -300,7 +323,7 @@ public class CommandsManagerImpl extends Manager implements CommandsManager {
                                     }
                                 }
 
-                                commandsCooldown.computeIfAbsent(uuid, u -> new HashMap<>()).put(commandLabel,
+                                commandsCooldown.computeIfAbsent(uuid, u -> new ConcurrentHashMap<>()).put(commandLabel,
                                         timeNow + commandCooldown.getKey());
                             }
                         }
@@ -341,6 +364,8 @@ public class CommandsManagerImpl extends Manager implements CommandsManager {
 
         @Override
         public List<String> tabComplete(CommandSender sender, String label, String[] args) {
+            if (plugin.getTaskScheduler().isFolia() && !plugin.isReady())
+                return Collections.emptyList();
             if (args.length > 0) {
                 SuperiorCommand command = playerCommandsMap.getCommand(args[0]);
                 if (command != null) {
