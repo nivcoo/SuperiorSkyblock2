@@ -127,7 +127,7 @@ public class EntityCategoriesSection implements SettingsManager.EntityCategories
         for (EntityCategory entityCategory : entityCategories) {
             BuiltinEntityCategory builtinCategory = EnumHelper.getEnum(BuiltinEntityCategory.class,
                     entityCategory.getName().toUpperCase(Locale.ENGLISH));
-            if (builtinCategory != null && builtinCategory.isExcludedFromTypeLookup())
+            if (builtinCategory != null && builtinCategory.requiresEntityState())
                 continue;
 
             for (Key key : entityCategory.getEntities()) {
